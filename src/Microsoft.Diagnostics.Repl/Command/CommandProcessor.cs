@@ -8,6 +8,7 @@ using System.CommandLine;
 using System.CommandLine.Builder;
 using System.CommandLine.Invocation;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -21,7 +22,7 @@ namespace Microsoft.Diagnostics.Repl
         private readonly Command _rootCommand;
         private readonly IServiceProvider _serviceProvider;
         private readonly IConsole _console;
-        private readonly Dictionary<string, Handler> _commandHandlers = new Dictionary<string, Handler>();
+        private readonly Dictionary<string, (Command command, Handler handler)> _commandHandlers = new Dictionary<string, (Command, Handler)>();
 
         /// <summary>
         /// Create an instance of the command processor;
@@ -67,11 +68,76 @@ namespace Microsoft.Diagnostics.Repl
         /// Parse the command line.
         /// </summary>
         /// <param name="commandLine">command line txt</param>
-        /// <returns>exit code</returns>
-        public Task<int> Parse(string commandLine)
+        /// <returns>exit code (0 mean success and 1 failure)</returns>
+        public async Task<int> Parse(string commandLine)
         {
+            // allow loading an extension assembly
+            if (commandLine.StartsWith("load "))
+            {
+                LoadExtension(commandLine.Substring("load ".Length));
+                _console.Out.WriteLine(); // better with a separation between commands
+                return 0;
+            }
+
+            // first check the base commands
             ParseResult result = _parser.Parse(commandLine);
-            return _parser.InvokeAsync(result, _console);
+            if (result.Errors.Count == 0)
+            {
+                var invocationResult = await _parser.InvokeAsync(result, _console);
+                _console.Out.WriteLine(); // better with a separation between commands
+                return invocationResult;
+            }
+
+            // try to find a match in the extension commands
+            var command = FindMatchingCommand(commandLine);
+            if (command == null)
+                return 1;
+
+            result = command.Parse(commandLine);
+            if (result.Errors.Count == 0)
+            {
+                var invocationResult = await result.Parser.InvokeAsync(result, _console);
+                _console.Out.WriteLine(); // better with a separation between commands
+
+                //var invocationResult = await _parser.InvokeAsync(result, _console);
+                //_console.Out.WriteLine();  // don't know why this is needed
+                return invocationResult;
+            }
+            return 1;
+        }
+
+        private Command FindMatchingCommand(string commandLine)
+        {
+            // extract the action verb:  "verb SPACE parameter"
+            var pos = commandLine.IndexOf(" ", StringComparison.Ordinal);
+            var action = (pos != -1) ? commandLine.Substring(0, pos) : commandLine;
+            var handler = _commandHandlers.Values
+                .FirstOrDefault(h => string.CompareOrdinal(action, h.command.Name) == 0);
+            return handler.command;
+        }
+
+        // TODO: implement LoadExtensionsFromFolder(string path)
+        private void LoadExtension(string path)
+        {
+            if (!File.Exists(path))
+            {
+                _console.Error.WriteLine($"Assembly {path} does not exist.");
+                return;
+            }
+
+            try
+            {
+                var assembly = Assembly.LoadFrom(path);
+
+                // this stores the extension commands into the same dictionary as the other commands
+                // TODO: maybe they should also be added into a custom Dictionary<command name, handler> to make the difference
+                //       like what is done with .chain in WinDBG or make command groups in help
+                BuildCommands(null, assembly);
+            }
+            catch (Exception e)
+            {
+                _console.Error.WriteLine($"Impossible to load {path} extension: {e.ToString()}");
+            }
         }
 
         /// <summary>
@@ -84,14 +150,31 @@ namespace Microsoft.Diagnostics.Repl
             if (string.IsNullOrEmpty(name)) {
                 return _rootCommand;
             }
-            else {
-                return _rootCommand.Children.OfType<Command>().FirstOrDefault((cmd) => name == cmd.Name || cmd.Aliases.Any((alias) => name == alias));
+            else
+            {
+                // look for the default commands first
+                var command = _rootCommand.Children.OfType<Command>().FirstOrDefault((cmd) => name == cmd.Name || cmd.Aliases.Any((alias) => name == alias));
+                if (command != null)
+                    return command;
+
+                // and then in the extension ones
+                command = FindMatchingCommand(name);
+                return command;
             }
         }
 
         private void BuildCommands(CommandLineBuilder rootBuilder, IEnumerable<Assembly> assemblies)
         {
-            BuildCommands(rootBuilder, assemblies.SelectMany((assembly) => assembly.GetExportedTypes()));
+            //BuildCommands(rootBuilder, assemblies.SelectMany((assembly) => assembly.GetExportedTypes()));
+            foreach (var assembly in assemblies)
+            {
+                BuildCommands(rootBuilder, assembly);
+            }
+        }
+
+        private void BuildCommands(CommandLineBuilder rootBuilder, Assembly assembly)
+        {
+            BuildCommands(rootBuilder, assembly.GetExportedTypes());
         }
 
         private void BuildCommands(CommandLineBuilder rootBuilder, IEnumerable<Type> types)
@@ -103,13 +186,26 @@ namespace Microsoft.Diagnostics.Repl
                     if (baseType == typeof(CommandBase)) {
                         break;
                     }
-                    BuildCommands(rootBuilder, baseType);
+
+                    var commandAndHandlers = BuildCommands(baseType);
+                    foreach (var (command, handler) in commandAndHandlers)
+                    {
+                        if (_commandHandlers.ContainsKey(command.Name))
+                        {
+                            _console.Error.WriteLine($"Command {command.Name} already exists.");
+                            continue;
+                        }
+
+                        _commandHandlers.Add(command.Name, (command, handler));
+                        rootBuilder?.AddCommand(command);
+                    }
                 }
             }
         }
 
-        private void BuildCommands(CommandLineBuilder rootBuilder, Type type)
+        private IEnumerable<(Command command, Handler handler)> BuildCommands(Type type)
         {
+            var commands = new List<(Command command, Handler handler)>();
             Command command = null;
 
             var baseAttributes = (BaseAttribute[])type.GetCustomAttributes(typeof(BaseAttribute), inherit: false);
@@ -162,10 +258,9 @@ namespace Microsoft.Diagnostics.Repl
                     }
 
                     var handler = new Handler(this, commandAttribute.AliasExpansion, arguments, properties, type);
-                    _commandHandlers.Add(command.Name, handler);
                     command.Handler = handler;
 
-                    rootBuilder.AddCommand(command);
+                    commands.Add((command, handler));
                 }
 
                 if (baseAttribute is CommandAliasAttribute commandAliasAttribute && IsValidPlatform(commandAliasAttribute))
@@ -177,6 +272,8 @@ namespace Microsoft.Diagnostics.Repl
                     command.AddAlias(commandAliasAttribute.Name);
                 }
             }
+
+            return commands;
         }
 
         private object GetService(Type serviceType)
@@ -272,6 +369,10 @@ namespace Microsoft.Diagnostics.Repl
                 {
                     return false;
                 }
+
+                // use the same separator as in WinDBG after help command
+                _commandProcessor._console.Out.WriteLine("-------------------------------------------------------------------------------");
+
                 // The InvocationContext is null so the options and arguments in the 
                 // command instance created don't get set. The context for the command
                 // requesting help (either the help command or some other command using
@@ -381,14 +482,38 @@ namespace Microsoft.Diagnostics.Repl
 
             void IHelpBuilder.Write(ICommand command)
             {
-                if (_commandProcessor._commandHandlers.TryGetValue(command.Name, out Handler handler))
+                if (_commandProcessor._commandHandlers.TryGetValue(command.Name, out (Command, Handler handler) commandAndHandler))
                 {
-                    if (handler.InvokeHelp()) {
+                    if (commandAndHandler.handler.InvokeHelp()) {
                         return;
                     }
+
+                    // by default, show the command description
+                    _commandProcessor._console.Out.WriteLine($"  {command.Description}");
+                    return;
                 }
-                var helpBuilder = new HelpBuilder(_commandProcessor._console, maxWidth: Console.WindowWidth);
-                helpBuilder.Write(command);
+
+                // otherwise, list all commands with their description
+                var commandsAndHandlers = _commandProcessor._commandHandlers.Values.OrderBy(ch => ch.command.Name).ToList();
+                var maxLength = GetMaxCommandNameLength(commandsAndHandlers);
+                foreach (var (cmd, handler) in commandsAndHandlers)
+                {
+                    // align the commands with 'help'
+                    _commandProcessor._console.Out.Write($"  {cmd.Name} ");
+                    _commandProcessor._console.Out.Write(new string(' ', maxLength - cmd.Name.Length));
+                    _commandProcessor._console.Out.WriteLine(cmd.Description);
+                }
+            }
+
+            private int GetMaxCommandNameLength(IEnumerable<(Command command, Handler handler)> commandsAndHandlers)
+            {
+                int maxLength = 0;
+                foreach (var (command, handler) in commandsAndHandlers)
+                {
+                    maxLength = Math.Max(maxLength, command.Name.Length);
+                }
+
+                return maxLength;
             }
         }
     }
